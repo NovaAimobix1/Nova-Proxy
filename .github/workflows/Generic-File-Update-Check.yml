@@ -1,0 +1,111 @@
+# ==============================================================================
+# Workflow: Generic File Update Check
+# Version: 2026-09-17-02
+# Description: Syncs target files from upstream repository into current branch.
+# ==============================================================================
+
+name: Generic File Update Check
+
+on:
+  schedule:
+    - cron: '30 20 * * *' # Runs daily at 20:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+
+    env:
+      UPSTREAM_REPO: 'IRNova/Nova-Proxy'
+      UPSTREAM_BRANCH: 'main'
+      UPDATE_MODE: ${{ vars.UPDATE_MODE }}
+      TARGET_PATHS: |
+        worker.js
+        version.json
+
+    steps:
+      - name: Fetch and Apply Updates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Configuring Git identity..."
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Cloning target repository..."
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+
+          echo "Parsing target paths..."
+          TARGET_ARRAY=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [ -n "$trimmed" ]; then
+              TARGET_ARRAY+=("$trimmed")
+            fi
+          done <<< "$TARGET_PATHS"
+
+          if [ ${#TARGET_ARRAY[@]} -eq 0 ]; then
+            echo "Error: TARGET_PATHS is empty." >&2
+            exit 1
+          fi
+
+          echo "Fetching upstream repository: ${UPSTREAM_REPO} (${UPSTREAM_BRANCH})..."
+          git fetch "https://github.com/${UPSTREAM_REPO}.git" "${UPSTREAM_BRANCH}"
+
+          echo "Validating target paths in upstream..."
+          for path in "${TARGET_ARRAY[@]}"; do
+            if ! git cat-file -e "FETCH_HEAD:${path}" 2>/dev/null; then
+              echo "Error: Required path '${path}' does not exist in upstream." >&2
+              exit 1
+            fi
+          done
+
+          echo "Checking out target files from upstream..."
+          git checkout FETCH_HEAD -- "${TARGET_ARRAY[@]}"
+
+          echo "Checking for local modifications..."
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes detected. Repository is up to date."
+            exit 0
+          fi
+
+          echo "Detected updates in target files."
+
+          if [ "${UPDATE_MODE:-}" = "automatic" ]; then
+            echo "UPDATE_MODE is set to 'automatic'. Applying changes directly to main..."
+            git add "${TARGET_ARRAY[@]}"
+            git commit -m "chore: automated update target files from upstream [skip ci]"
+            git push origin main
+            echo "Changes successfully pushed to main branch."
+          else
+            echo "UPDATE_MODE is not 'automatic'. Falling back to Pull Request mode..."
+            BRANCH_NAME="auto-update-target-files"
+            git checkout -B "$BRANCH_NAME"
+            git add "${TARGET_ARRAY[@]}"
+            git commit -m "chore: update target files from upstream"
+            git push --force-with-lease origin "$BRANCH_NAME"
+
+            PR_TITLE="Automated Update: Target Files from Upstream"
+            PR_BODY="This is an automated pull request checking for and updating tracked files from upstream (${UPSTREAM_REPO})."
+
+            EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number --jq '.[0].number')
+
+            if [ -n "$EXISTING_PR" ]; then
+              echo "Pull request #${EXISTING_PR} already exists and has been updated."
+            else
+              echo "Creating new pull request..."
+              gh pr create \
+                --title "$PR_TITLE" \
+                --body "$PR_BODY" \
+                --head "$BRANCH_NAME" \
+                --base main \
+                --label "dependencies,automated pr"
+            fi
+          fi
